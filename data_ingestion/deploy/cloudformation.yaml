@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template for AI-powered Acquisition Evaluation System Data Ingestion Pipelines
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: CBGlobalAI
+    Description: A unique name for the project, used as a prefix for resource names.
+  RawDataBucketName:
+    Type: String
+    Default: cb-global-raw-financial-data
+    Description: Name for the S3 bucket storing raw ingested data.
+  ProcessedDataBucketName:
+    Type: String
+    Default: cb-global-processed-financial-data
+    Description: Name for the S3 bucket storing processed data.
+  FinancialApiBaseUrl:
+    Type: String
+    Default: https://api.example.com/v1
+    Description: Base URL for the external financial data API.
+  FinancialApiKeySecretArn:
+    Type: String
+    Description: ARN of the AWS Secrets Manager secret storing the financial API key.
+
+Resources:
+  # S3 Buckets for Raw and Processed Data
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${RawDataBucketName}-${AWS::AccountId}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataTier
+          Value: Raw
+      LifecycleConfiguration:
+        Rules:
+          - Id: RawDataRetention
+            Status: Enabled
+            ExpirationInDays: 90 # Retain raw data for 90 days for audit/reprocessing
+            AbortIncompleteMultipartUpload: 
+              DaysAfterInitiation: 7
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProcessedDataBucketName}-${AWS::AccountId}'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: DataTier
+          Value: Processed
+      LifecycleConfiguration:
+        Rules:
+          - Id: ProcessedDataRetention
+            Status: Enabled
+            ExpirationInDays: 365 # Retain processed data for 1 year
+            AbortIncompleteMultipartUpload: 
+              DaysAfterInitiation: 7
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for Data Ingestion Lambda (for external API calls and S3 writes)
+  IngestionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref FinancialApiKeySecretArn
+
+  # IAM Role for Data Processing Lambda (for S3 reads and writes)
+  ProcessingLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub '${ProcessedDataBucket.Arn}/*'
+
+  # Lambda Function for Data Ingestion
+  FinancialDataIngestorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-FinancialDataIngestor'
+      Handler: financial_data_ingestor.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref CodeBucket # Assumes a code bucket exists or is created by CI/CD
+        S3Key: data_ingestion/financial_data_ingestor.zip # Path to your zipped code
+      MemorySize: 512 # Adjust based on data volume and processing needs
+      Timeout: 300 # 5 minutes, adjust for long-running API calls
+      Role: !GetAtt IngestionLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          FINANCIAL_API_BASE_URL: !Ref FinancialApiBaseUrl
+          FINANCIAL_API_KEY_SECRET_ARN: !Ref FinancialApiKeySecretArn
+          RAW_DATA_S3_BUCKET: !Ref RawDataBucketName
+          S3_RAW_DATA_PREFIX: financial_data
+
+  # Lambda Function for Data Processing (triggered by S3 event)
+  DataProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-DataProcessor'
+      Handler: data_processing_lambda.lambda_handler
+      Runtime: python3.9
+      Code:
+        S3Bucket: !Ref CodeBucket # Assumes a code bucket exists or is created by CI/CD
+        S3Key: data_ingestion/data_processing_lambda.zip # Path to your zipped code
+      MemorySize: 1024 # Adjust based on data volume and processing needs
+      Timeout: 600 # 10 minutes
+      Role: !GetAtt ProcessingLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_DATA_S3_BUCKET: !Ref ProcessedDataBucketName
+          S3_PROCESSED_DATA_PREFIX: processed_data
+
+  # S3 Event Notification for DataProcessingLambda
+  RawDataBucketNotificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DataProcessingLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt RawDataBucket.Arn
+
+  RawDataBucketNotification:
+    Type: AWS::S3::BucketNotificationConfiguration
+    Properties:
+      Bucket: !Ref RawDataBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt DataProcessingLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: financial_data/
+                  - Name: suffix
+                    Value: .json
+
+  # EventBridge Rule to trigger Ingestion Lambda daily
+  DailyIngestionEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-DailyFinancialIngestionRule'
+      Description: Triggers the financial data ingestion Lambda daily.
+      ScheduleExpression: cron(0 6 * * ? *) # Every day at 6:00 AM UTC
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FinancialDataIngestorLambda.Arn
+          Id: FinancialDataIngestorLambdaTarget
+          Input: '{"action": "run_daily_ingestion"}' # Example input, customize as needed
+
+  DailyIngestionLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FinancialDataIngestorLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyIngestionEventRule.Arn
+
+Outputs:
+  RawDataBucketNameOutput:
+    Description: Name of the S3 bucket for raw data.
+    Value: !Ref RawDataBucket
+  ProcessedDataBucketNameOutput:
+    Description: Name of the S3 bucket for processed data.
+    Value: !Ref ProcessedDataBucket
+  FinancialDataIngestorLambdaName:
+    Description: Name of the Financial Data Ingestor Lambda function.
+    Value: !Ref FinancialDataIngestorLambda
+  DataProcessingLambdaName:
+    Description: Name of the Data Processing Lambda function.
+    Value: !Ref DataProcessingLambda
